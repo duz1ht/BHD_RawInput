@@ -1,21 +1,19 @@
-// dllmain.cpp : BHD_RawInput_Hook (WM_INPUT + ClipCursor + Shared Memory + RawMouse injector)
+// dllmain.cpp : BHD_RawInput_Hook
 //
-// This build does:
+// Features:
 //  - Hooks the game window WndProc to capture WM_INPUT raw mouse deltas.
 //  - Hooks user32!ClipCursor via EXE IAT patch to detect "captured" state.
-//  - Publishes stats via shared memory: "Local\\BHD_RawInput_Shared".
-//  - Writes hook_write.txt in the EXE directory using Win32 file APIs.
+//  - Publishes window-based stats via shared memory: "Local\\BHD_RawInput_Shared" (version 2).
 //  - Injects WM_INPUT deltas into the game's RawMouseX/Y by hooking the game's
-//    "FIX MOUSE LOGIC" code block at 0x005E48C0 (from RE asm).
+//    "FIX MOUSE LOGIC" block at 0x005E48C0 (from your RE asm).
 //
-// Goal of injection:
-//  - Stop relying on cursor delta per frame (frame-based behavior).
-//  - Feed the engine a "sum of raw input counts since last game tick".
-//  - Keep cursor centered to preserve the game's capture expectations.
+// Goal:
+//  - Feed the engine a sum of raw input counts since last game mouse tick.
+//  - Provide observable metrics (windowed HW vs Inject) so the overlay can verify behavior.
 //
 // Build notes:
 //  - x86
-//  - Keep pch enabled for this file as in your project.
+//  - Keep pch enabled for this file (include pch.h first).
 
 #include "pch.h"
 #include <windows.h>
@@ -25,7 +23,7 @@
 #include <stdint.h>
 
 // ------------------------------------------------------------
-// Paths
+// Paths + Logging
 // ------------------------------------------------------------
 
 static std::wstring GetExeDirW()
@@ -45,10 +43,6 @@ static std::wstring JoinPathW(const std::wstring& a, const std::wstring& b)
 }
 
 static std::wstring g_logPath;
-
-// ------------------------------------------------------------
-// Logging (Win32, reliable for early DLL load)
-// ------------------------------------------------------------
 
 static void EnsureLogPathReady()
 {
@@ -91,38 +85,63 @@ static void LogLineWithLastError(const wchar_t* prefix)
 
 // ------------------------------------------------------------
 // Shared memory (overlay reads this)
+// New layout: version 2
 // ------------------------------------------------------------
 
+static const DWORD kCompareWindowMs = 100;
+
 #pragma pack(push, 1)
-struct SharedHudState
+struct SharedHudStateV2
 {
-    uint32_t magic;       // 'BHDR'
-    uint32_t version;     // 1
+    uint32_t magic;        // 'BHDR' = 0x52444842
+    uint32_t version;      // 2
 
-    volatile LONG isCaptured;      // 0/1 based on ClipCursor
-    volatile LONG lastRawDx;       // last WM_INPUT delta
-    volatile LONG lastRawDy;
+    volatile LONG isCaptured;      // 0/1 based on ClipCursor(rect)/ClipCursor(NULL)
 
-    volatile LONG rawTotalX;       // running totals
-    volatile LONG rawTotalY;
+    // Last raw input delta observed (most recent WM_INPUT)
+    volatile LONG hwLastDx;
+    volatile LONG hwLastDy;
 
-    volatile LONG rawEventCount;   // WM_INPUT events with non-zero delta
-    volatile LONG tick;            // increments on each WM_INPUT non-zero delta
+    // Last injected delta consumed at game tick (most recent OnFixMouseLogic)
+    volatile LONG injLastDx;
+    volatile LONG injLastDy;
 
-    volatile LONG lastUpdateMs;    // GetTickCount() at last update
+    // "Current window" (in-progress, rolling for kCompareWindowMs)
+    volatile LONG hwWinCurX;
+    volatile LONG hwWinCurY;
+    volatile LONG injWinCurX;
+    volatile LONG injWinCurY;
+
+    // "Last window" (finalized snapshot)
+    volatile LONG hwWinLastX;
+    volatile LONG hwWinLastY;
+    volatile LONG injWinLastX;
+    volatile LONG injWinLastY;
+
+    // Estimated rates (updated ~1Hz)
+    volatile LONG estHwEventsPerSec;     // WM_INPUT non-zero events per second
+    volatile LONG estInjTicksPerSec;     // OnFixMouseLogic calls per second (game mouse tickrate estimate)
+
+    // Counters (monotonic, but not meant for human comparison)
+    volatile LONG hwEventCount;          // WM_INPUT events with non-zero delta (since start)
+    volatile LONG injTickCount;          // injection ticks (since start)
+
+    volatile LONG lastUpdateMs;          // GetTickCount() when state was last updated
 };
 #pragma pack(pop)
 
+static const wchar_t* kMapName = L"Local\\BHD_RawInput_Shared";
+
 static HANDLE g_hMap = nullptr;
-static SharedHudState* g_hud = nullptr;
+static SharedHudStateV2* g_hud = nullptr;
 
 static void HudInit()
 {
     if (g_hud) return;
 
     g_hMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
-        (DWORD)sizeof(SharedHudState),
-        L"Local\\BHD_RawInput_Shared");
+        (DWORD)sizeof(SharedHudStateV2),
+        kMapName);
 
     if (!g_hMap)
     {
@@ -131,7 +150,7 @@ static void HudInit()
         return;
     }
 
-    void* p = MapViewOfFile(g_hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedHudState));
+    void* p = MapViewOfFile(g_hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedHudStateV2));
     if (!p)
     {
         LogLine(L"[hud] MapViewOfFile failed");
@@ -141,21 +160,14 @@ static void HudInit()
         return;
     }
 
-    g_hud = reinterpret_cast<SharedHudState*>(p);
+    g_hud = reinterpret_cast<SharedHudStateV2*>(p);
+    ZeroMemory((void*)g_hud, sizeof(*g_hud));
 
-    g_hud->magic = 0x52444842;   // 'BHDR'
-    g_hud->version = 1;
-
-    g_hud->isCaptured = 0;
-    g_hud->lastRawDx = 0;
-    g_hud->lastRawDy = 0;
-    g_hud->rawTotalX = 0;
-    g_hud->rawTotalY = 0;
-    g_hud->rawEventCount = 0;
-    g_hud->tick = 0;
+    g_hud->magic = 0x52444842; // 'BHDR'
+    g_hud->version = 2;
     g_hud->lastUpdateMs = (LONG)GetTickCount();
 
-    LogLine(L"[hud] Shared memory initialized: Local\\BHD_RawInput_Shared");
+    LogLine(L"[hud] Shared memory initialized: Local\\BHD_RawInput_Shared (v2)");
 }
 
 static void HudShutdown()
@@ -173,41 +185,84 @@ static void HudShutdown()
 }
 
 // ------------------------------------------------------------
-// Raw Input state
+// Raw Input capture accumulation
 // ------------------------------------------------------------
 
-static std::atomic<long> g_rawDx{ 0 };
-static std::atomic<long> g_rawDy{ 0 };
+static std::atomic<LONG> g_pendingDx{ 0 };
+static std::atomic<LONG> g_pendingDy{ 0 };
+
+// For event rate estimation
+static std::atomic<LONG> g_hwEventsThisSecond{ 0 };
+static DWORD g_hwRateLastMs = 0;
+
+// Windowing
+static DWORD g_winStartMs = 0;
+static LONG  g_hwWinAccX = 0;
+static LONG  g_hwWinAccY = 0;
+static LONG  g_injWinAccX = 0;
+static LONG  g_injWinAccY = 0;
+
+// For injection tickrate estimation
+static std::atomic<LONG> g_injTicksThisSecond{ 0 };
+static DWORD g_injRateLastMs = 0;
+
+// ------------------------------------------------------------
+// Window + rate helpers
+// ------------------------------------------------------------
+
+static void FinalizeWindowIfNeeded(DWORD now)
+{
+    if (g_winStartMs == 0)
+        g_winStartMs = now;
+
+    if ((DWORD)(now - g_winStartMs) < kCompareWindowMs)
+        return;
+
+    if (g_hud)
+    {
+        g_hud->hwWinLastX = g_hwWinAccX;
+        g_hud->hwWinLastY = g_hwWinAccY;
+        g_hud->injWinLastX = g_injWinAccX;
+        g_hud->injWinLastY = g_injWinAccY;
+    }
+
+    g_hwWinAccX = 0;
+    g_hwWinAccY = 0;
+    g_injWinAccX = 0;
+    g_injWinAccY = 0;
+    g_winStartMs = now;
+}
+
+static void UpdateRatesIfNeeded(DWORD now)
+{
+    // Update both estimates about once per second
+    if (g_hwRateLastMs == 0) g_hwRateLastMs = now;
+    if (g_injRateLastMs == 0) g_injRateLastMs = now;
+
+    if ((DWORD)(now - g_hwRateLastMs) >= 1000)
+    {
+        LONG v = g_hwEventsThisSecond.exchange(0, std::memory_order_relaxed);
+        if (g_hud) g_hud->estHwEventsPerSec = v;
+        g_hwRateLastMs = now;
+    }
+
+    if ((DWORD)(now - g_injRateLastMs) >= 1000)
+    {
+        LONG v = g_injTicksThisSecond.exchange(0, std::memory_order_relaxed);
+        if (g_hud) g_hud->estInjTicksPerSec = v;
+        g_injRateLastMs = now;
+    }
+}
+
+// ------------------------------------------------------------
+// Raw Input registration + WndProc hook
+// ------------------------------------------------------------
 
 static std::atomic<HWND>    g_hookedHwnd{ nullptr };
 static std::atomic<WNDPROC> g_originalWndProc{ nullptr };
 static std::atomic<bool>    g_wndprocHooked{ false };
 static std::atomic<bool>    g_rawRegistered{ false };
 static std::atomic<bool>    g_stop{ false };
-
-// Game window handle for center computation
-static std::atomic<HWND> g_gameHwnd{ nullptr };
-
-// ------------------------------------------------------------
-// Game addresses (from RE asm you provided)
-// ------------------------------------------------------------
-
-static const uintptr_t ADDR_FIX_MOUSE_LOGIC = 0x005E48C0;     // "FIX MOUSE LOGIC [005E48C0]"
-static const uintptr_t ADDR_FIX_MOUSE_RET = 0x005679BA;     // "JMP 005679BA ; GO TO END OF FUNCTION"
-
-// Game variables (same ones your overlay reads)
-static const uintptr_t ADDR_CURSOR_X = 0x00F655E0;
-static const uintptr_t ADDR_CURSOR_Y = 0x00F655E4;
-static const uintptr_t ADDR_RAWMOUSE_X = 0x00F655EC;
-static const uintptr_t ADDR_RAWMOUSE_Y = 0x00F655F0;
-
-// Video resolution globals from asm
-static const uintptr_t ADDR_VID_WIDTH = 0x009F72C0;          // "VIDEO WIDTH"
-static const uintptr_t ADDR_VID_HEIGHT = 0x009F72C4;          // "VIDEO HEIGHT"
-
-// ------------------------------------------------------------
-// Raw Input registration
-// ------------------------------------------------------------
 
 static bool RegisterRawInput(HWND hwnd)
 {
@@ -227,10 +282,6 @@ static bool RegisterRawInput(HWND hwnd)
     LogLine(L"[raw] RegisterRawInputDevices OK");
     return true;
 }
-
-// ------------------------------------------------------------
-// WndProc hook (WM_INPUT capture only)
-// ------------------------------------------------------------
 
 static LRESULT CALLBACK HookWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -252,22 +303,33 @@ static LRESULT CALLBACK HookWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
                     if (dx || dy)
                     {
-                        g_rawDx.fetch_add(dx, std::memory_order_relaxed);
-                        g_rawDy.fetch_add(dy, std::memory_order_relaxed);
+                        g_pendingDx.fetch_add(dx, std::memory_order_relaxed);
+                        g_pendingDy.fetch_add(dy, std::memory_order_relaxed);
 
+                        DWORD now = GetTickCount();
+
+                        // Update shared state
                         if (g_hud)
                         {
-                            g_hud->lastRawDx = dx;
-                            g_hud->lastRawDy = dy;
+                            g_hud->hwLastDx = dx;
+                            g_hud->hwLastDy = dy;
 
-                            InterlockedExchangeAdd(&g_hud->rawTotalX, dx);
-                            InterlockedExchangeAdd(&g_hud->rawTotalY, dy);
+                            // Window accumulators for HW
+                            g_hwWinAccX += dx;
+                            g_hwWinAccY += dy;
 
-                            InterlockedIncrement(&g_hud->rawEventCount);
-                            InterlockedIncrement(&g_hud->tick);
+                            g_hud->hwWinCurX = g_hwWinAccX;
+                            g_hud->hwWinCurY = g_hwWinAccY;
 
-                            g_hud->lastUpdateMs = (LONG)GetTickCount();
+                            InterlockedIncrement(&g_hud->hwEventCount);
+                            g_hud->lastUpdateMs = (LONG)now;
                         }
+
+                        g_hwEventsThisSecond.fetch_add(1, std::memory_order_relaxed);
+
+                        // Maintain rolling windows and rates
+                        FinalizeWindowIfNeeded(now);
+                        UpdateRatesIfNeeded(now);
                     }
                 }
             }
@@ -285,10 +347,7 @@ static LRESULT CALLBACK HookWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 // Find best window for this PID (largest client area)
 // ------------------------------------------------------------
 
-static DWORD GetThisPid()
-{
-    return GetCurrentProcessId();
-}
+static DWORD GetThisPid() { return GetCurrentProcessId(); }
 
 struct Candidate
 {
@@ -395,7 +454,7 @@ static bool PatchIAT_ByFunctionName(void* moduleBase, const char* funcName, void
 }
 
 // ------------------------------------------------------------
-// ClipCursor hook to detect in-map capture
+// ClipCursor hook to detect capture
 // ------------------------------------------------------------
 
 typedef BOOL(WINAPI* PFN_ClipCursor)(const RECT*);
@@ -460,6 +519,24 @@ static bool TryInstallWndProcOnce(HWND hwnd)
 }
 
 // ------------------------------------------------------------
+// Game addresses (from your RE asm)
+// ------------------------------------------------------------
+
+static const uintptr_t ADDR_FIX_MOUSE_LOGIC = 0x005E48C0;
+static const uintptr_t ADDR_FIX_MOUSE_RET = 0x005679BA;
+
+static const uintptr_t ADDR_CURSOR_X = 0x00F655E0;
+static const uintptr_t ADDR_CURSOR_Y = 0x00F655E4;
+static const uintptr_t ADDR_RAWMOUSE_X = 0x00F655EC;
+static const uintptr_t ADDR_RAWMOUSE_Y = 0x00F655F0;
+
+static const uintptr_t ADDR_VID_WIDTH = 0x009F72C0;
+static const uintptr_t ADDR_VID_HEIGHT = 0x009F72C4;
+
+// Game window handle for cursor centering
+static std::atomic<HWND> g_gameHwnd{ nullptr };
+
+// ------------------------------------------------------------
 // Minimal x86 detour (JMP rel32) for FIX MOUSE LOGIC
 // ------------------------------------------------------------
 
@@ -467,7 +544,7 @@ static uint8_t g_fixMouseOrig[6]{};
 static void* g_fixMouseTrampoline = nullptr;
 static std::atomic<bool> g_fixMouseHooked{ false };
 
-static void* MakeTrampoline(void* target, const uint8_t* origBytes, size_t origLen, void* backTo)
+static void* MakeTrampoline(const uint8_t* origBytes, size_t origLen, void* backTo)
 {
     uint8_t* mem = (uint8_t*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!mem) return nullptr;
@@ -475,7 +552,7 @@ static void* MakeTrampoline(void* target, const uint8_t* origBytes, size_t origL
     memcpy(mem, origBytes, origLen);
 
     uint8_t* jmpAt = mem + origLen;
-    jmpAt[0] = 0xE9; // JMP rel32
+    jmpAt[0] = 0xE9;
     *(int32_t*)(jmpAt + 1) = (int32_t)((uint8_t*)backTo - (jmpAt + 5));
 
     FlushInstructionCache(GetCurrentProcess(), mem, 64);
@@ -489,11 +566,11 @@ static bool WriteJmp5(void* at, void* to, int extraNops)
         return false;
 
     uint8_t* p = (uint8_t*)at;
-    p[0] = 0xE9; // JMP rel32
+    p[0] = 0xE9;
     *(int32_t*)(p + 1) = (int32_t)((uint8_t*)to - (p + 5));
 
     for (int i = 0; i < extraNops; ++i)
-        p[5 + i] = 0x90; // NOP
+        p[5 + i] = 0x90;
 
     DWORD tmp = 0;
     VirtualProtect(at, 5 + extraNops, oldProt, &tmp);
@@ -501,17 +578,9 @@ static bool WriteJmp5(void* at, void* to, int extraNops)
     return true;
 }
 
-static __forceinline LONG ReadI32(uintptr_t addr)
-{
-    return *(volatile LONG*)addr;
-}
+static __forceinline LONG ReadI32(uintptr_t addr) { return *(volatile LONG*)addr; }
+static __forceinline void WriteI32(uintptr_t addr, LONG v) { *(volatile LONG*)addr = v; }
 
-static __forceinline void WriteI32(uintptr_t addr, LONG v)
-{
-    *(volatile LONG*)addr = v;
-}
-
-// Helper: center OS cursor on the game client rect in screen coords.
 static bool CenterCursorOnGameClient(HWND hwnd)
 {
     if (!hwnd || !IsWindow(hwnd)) return false;
@@ -529,34 +598,54 @@ static bool CenterCursorOnGameClient(HWND hwnd)
     return true;
 }
 
-// This runs inside the detour with registers already saved.
+// Called inside the detour
 static bool __stdcall OnFixMouseLogic()
 {
-    // Only inject when captured (in-map) to avoid messing with menus/UI.
     if (!g_hud || g_hud->isCaptured == 0)
         return false;
 
-    // Consume accumulated WM_INPUT counts since last time the game asked for mouse.
-    LONG dx = (LONG)g_rawDx.exchange(0, std::memory_order_relaxed);
-    LONG dy = (LONG)g_rawDy.exchange(0, std::memory_order_relaxed);
+    // Consume all raw counts since last game mouse tick
+    LONG dx = (LONG)g_pendingDx.exchange(0, std::memory_order_relaxed);
+    LONG dy = (LONG)g_pendingDy.exchange(0, std::memory_order_relaxed);
 
-    // Keep OS cursor centered (so the game capture assumptions stay stable).
+    DWORD now = GetTickCount();
+
+    // Keep OS cursor centered to preserve capture behavior
     HWND hwnd = g_gameHwnd.load(std::memory_order_relaxed);
     CenterCursorOnGameClient(hwnd);
 
-    // Keep the game's "cursor" values at center in its own units.
+    // Keep engine cursor centered (in its own units)
     LONG w = ReadI32(ADDR_VID_WIDTH);
     LONG h = ReadI32(ADDR_VID_HEIGHT);
     LONG halfW = (w >> 1);
     LONG halfH = (h >> 1);
 
-    // Write raw input counts into the engine mouse vars.
+    // Inject into engine
     WriteI32(ADDR_RAWMOUSE_X, dx);
     WriteI32(ADDR_RAWMOUSE_Y, dy);
-
-    // Force engine cursor to center (prevents drift in code paths that read CursorX/Y).
     WriteI32(ADDR_CURSOR_X, halfW);
     WriteI32(ADDR_CURSOR_Y, halfH);
+
+    // Publish injection stats
+    if (g_hud)
+    {
+        g_hud->injLastDx = dx;
+        g_hud->injLastDy = dy;
+
+        g_injWinAccX += dx;
+        g_injWinAccY += dy;
+        g_hud->injWinCurX = g_injWinAccX;
+        g_hud->injWinCurY = g_injWinAccY;
+
+        InterlockedIncrement(&g_hud->injTickCount);
+        g_hud->lastUpdateMs = (LONG)now;
+    }
+
+    g_injTicksThisSecond.fetch_add(1, std::memory_order_relaxed);
+
+    // Maintain rolling windows and rates (also handles cases with no WM_INPUT)
+    FinalizeWindowIfNeeded(now);
+    UpdateRatesIfNeeded(now);
 
     return true;
 }
@@ -564,10 +653,6 @@ static bool __stdcall OnFixMouseLogic()
 typedef void(__stdcall* FixMouseTrampFn)();
 static FixMouseTrampFn g_fixMouseTrampFn = nullptr;
 
-// Detour for 0x005E48C0.
-// We overwrite 6 bytes (the first instruction is "ADD EAX,[0060C326]" which is 6 bytes in x86).
-// If captured: inject WM_INPUT counts and jump to 0x005679BA (end of function).
-// If not captured: execute trampoline (original bytes) and continue normal behavior.
 __declspec(naked) void FixMouseLogic_Detour()
 {
     __asm {
@@ -589,8 +674,6 @@ __declspec(naked) void FixMouseLogic_Detour()
     }
 }
 
-// Optional sanity check: verify the first bytes match "ADD EAX,[0060C326]" pattern.
-// x86 absolute add: 03 05 <addr32>
 static bool FixMouseBytesLookRight()
 {
     uint8_t* p = (uint8_t*)ADDR_FIX_MOUSE_LOGIC;
@@ -598,7 +681,6 @@ static bool FixMouseBytesLookRight()
     {
         if (p[0] != 0x03) return false;
         if (p[1] != 0x05) return false;
-        // Next 4 bytes should be 0x0060C326 (little endian: 26 C3 60 00)
         if (*(uint32_t*)(p + 2) != 0x0060C326) return false;
         return true;
     }
@@ -620,11 +702,10 @@ static bool InstallFixMouseLogicHookOnce()
     }
 
     uint8_t* target = (uint8_t*)ADDR_FIX_MOUSE_LOGIC;
-
     memcpy(g_fixMouseOrig, target, sizeof(g_fixMouseOrig));
 
     void* backTo = (void*)(ADDR_FIX_MOUSE_LOGIC + 6);
-    g_fixMouseTrampoline = MakeTrampoline((void*)target, g_fixMouseOrig, 6, backTo);
+    g_fixMouseTrampoline = MakeTrampoline(g_fixMouseOrig, 6, backTo);
     if (!g_fixMouseTrampoline)
     {
         LogLine(L"[mouse] Failed to allocate trampoline");
@@ -633,7 +714,6 @@ static bool InstallFixMouseLogicHookOnce()
 
     g_fixMouseTrampFn = (FixMouseTrampFn)g_fixMouseTrampoline;
 
-    // Patch 6 bytes: 5-byte JMP + 1 NOP
     if (!WriteJmp5(target, (void*)&FixMouseLogic_Detour, 1))
     {
         LogLine(L"[mouse] Failed to patch FIX MOUSE LOGIC");
@@ -673,7 +753,6 @@ static DWORD WINAPI MonitorThread(LPVOID)
             if (!clipHooked)
                 clipHooked = InstallClipCursorIAT();
 
-            // New: install the game mouse injection hook once the game is running.
             InstallFixMouseLogicHookOnce();
         }
 
@@ -682,12 +761,11 @@ static DWORD WINAPI MonitorThread(LPVOID)
 
     LogLine(L"[hook] MonitorThread stopping");
     HudShutdown();
-
     return 0;
 }
 
 // ------------------------------------------------------------
-// Init thread and DllMain
+// Init thread + DllMain
 // ------------------------------------------------------------
 
 static DWORD WINAPI InitThread(LPVOID)
@@ -696,9 +774,13 @@ static DWORD WINAPI InitThread(LPVOID)
 
     HudInit();
 
+    g_winStartMs = GetTickCount();
+    g_hwRateLastMs = g_winStartMs;
+    g_injRateLastMs = g_winStartMs;
+
     LogLine(L"[hook] WM_INPUT raw capture enabled");
     LogLine(L"[hook] ClipCursor hook enabled (capture detection)");
-    LogLine(L"[hook] HUD shared memory: Local\\BHD_RawInput_Shared");
+    LogLine(L"[hook] HUD shared memory: Local\\BHD_RawInput_Shared (v2)");
     LogLine(L"[hook] RawMouse injector: hook at 0x005E48C0 (FIX MOUSE LOGIC)");
     LogLine(L"[hook] InitThread end");
 
@@ -721,7 +803,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(hModule);
-
         g_stop.store(false, std::memory_order_relaxed);
 
         LogLine(L"[hook] DLL_PROCESS_ATTACH");
