@@ -1,10 +1,17 @@
-// dllmain.cpp : BHD_RawInput_Hook (WM_INPUT + ClipCursor + Shared Memory)
+// dllmain.cpp : BHD_RawInput_Hook (WM_INPUT + ClipCursor + Shared Memory + RawMouse injector)
 //
 // This build does:
 //  - Hooks the game window WndProc to capture WM_INPUT raw mouse deltas.
 //  - Hooks user32!ClipCursor via EXE IAT patch to detect "captured" state.
 //  - Publishes stats via shared memory: "Local\\BHD_RawInput_Shared".
-//  - Writes hook_write.txt in the EXE directory using Win32 file APIs (reliable in DLL context).
+//  - Writes hook_write.txt in the EXE directory using Win32 file APIs.
+//  - Injects WM_INPUT deltas into the game's RawMouseX/Y by hooking the game's
+//    "FIX MOUSE LOGIC" code block at 0x005E48C0 (from RE asm).
+//
+// Goal of injection:
+//  - Stop relying on cursor delta per frame (frame-based behavior).
+//  - Feed the engine a "sum of raw input counts since last game tick".
+//  - Keep cursor centered to preserve the game's capture expectations.
 //
 // Build notes:
 //  - x86
@@ -65,7 +72,6 @@ static void LogLine(const wchar_t* line)
     if (h == INVALID_HANDLE_VALUE)
         return;
 
-    // Write UTF-16LE text as-is, with CRLF.
     DWORD bytes = 0;
     WriteFile(h, line, (DWORD)(wcslen(line) * sizeof(wchar_t)), &bytes, nullptr);
 
@@ -178,6 +184,26 @@ static std::atomic<WNDPROC> g_originalWndProc{ nullptr };
 static std::atomic<bool>    g_wndprocHooked{ false };
 static std::atomic<bool>    g_rawRegistered{ false };
 static std::atomic<bool>    g_stop{ false };
+
+// Game window handle for center computation
+static std::atomic<HWND> g_gameHwnd{ nullptr };
+
+// ------------------------------------------------------------
+// Game addresses (from RE asm you provided)
+// ------------------------------------------------------------
+
+static const uintptr_t ADDR_FIX_MOUSE_LOGIC = 0x005E48C0;     // "FIX MOUSE LOGIC [005E48C0]"
+static const uintptr_t ADDR_FIX_MOUSE_RET = 0x005679BA;     // "JMP 005679BA ; GO TO END OF FUNCTION"
+
+// Game variables (same ones your overlay reads)
+static const uintptr_t ADDR_CURSOR_X = 0x00F655E0;
+static const uintptr_t ADDR_CURSOR_Y = 0x00F655E4;
+static const uintptr_t ADDR_RAWMOUSE_X = 0x00F655EC;
+static const uintptr_t ADDR_RAWMOUSE_Y = 0x00F655F0;
+
+// Video resolution globals from asm
+static const uintptr_t ADDR_VID_WIDTH = 0x009F72C0;          // "VIDEO WIDTH"
+static const uintptr_t ADDR_VID_HEIGHT = 0x009F72C4;          // "VIDEO HEIGHT"
 
 // ------------------------------------------------------------
 // Raw Input registration
@@ -434,6 +460,192 @@ static bool TryInstallWndProcOnce(HWND hwnd)
 }
 
 // ------------------------------------------------------------
+// Minimal x86 detour (JMP rel32) for FIX MOUSE LOGIC
+// ------------------------------------------------------------
+
+static uint8_t g_fixMouseOrig[6]{};
+static void* g_fixMouseTrampoline = nullptr;
+static std::atomic<bool> g_fixMouseHooked{ false };
+
+static void* MakeTrampoline(void* target, const uint8_t* origBytes, size_t origLen, void* backTo)
+{
+    uint8_t* mem = (uint8_t*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!mem) return nullptr;
+
+    memcpy(mem, origBytes, origLen);
+
+    uint8_t* jmpAt = mem + origLen;
+    jmpAt[0] = 0xE9; // JMP rel32
+    *(int32_t*)(jmpAt + 1) = (int32_t)((uint8_t*)backTo - (jmpAt + 5));
+
+    FlushInstructionCache(GetCurrentProcess(), mem, 64);
+    return mem;
+}
+
+static bool WriteJmp5(void* at, void* to, int extraNops)
+{
+    DWORD oldProt = 0;
+    if (!VirtualProtect(at, 5 + extraNops, PAGE_EXECUTE_READWRITE, &oldProt))
+        return false;
+
+    uint8_t* p = (uint8_t*)at;
+    p[0] = 0xE9; // JMP rel32
+    *(int32_t*)(p + 1) = (int32_t)((uint8_t*)to - (p + 5));
+
+    for (int i = 0; i < extraNops; ++i)
+        p[5 + i] = 0x90; // NOP
+
+    DWORD tmp = 0;
+    VirtualProtect(at, 5 + extraNops, oldProt, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), at, 5 + extraNops);
+    return true;
+}
+
+static __forceinline LONG ReadI32(uintptr_t addr)
+{
+    return *(volatile LONG*)addr;
+}
+
+static __forceinline void WriteI32(uintptr_t addr, LONG v)
+{
+    *(volatile LONG*)addr = v;
+}
+
+// Helper: center OS cursor on the game client rect in screen coords.
+static bool CenterCursorOnGameClient(HWND hwnd)
+{
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    RECT rc{};
+    if (!GetClientRect(hwnd, &rc)) return false;
+
+    POINT pt{};
+    pt.x = (rc.right - rc.left) / 2;
+    pt.y = (rc.bottom - rc.top) / 2;
+
+    if (!ClientToScreen(hwnd, &pt)) return false;
+
+    ::SetCursorPos(pt.x, pt.y);
+    return true;
+}
+
+// This runs inside the detour with registers already saved.
+static bool __stdcall OnFixMouseLogic()
+{
+    // Only inject when captured (in-map) to avoid messing with menus/UI.
+    if (!g_hud || g_hud->isCaptured == 0)
+        return false;
+
+    // Consume accumulated WM_INPUT counts since last time the game asked for mouse.
+    LONG dx = (LONG)g_rawDx.exchange(0, std::memory_order_relaxed);
+    LONG dy = (LONG)g_rawDy.exchange(0, std::memory_order_relaxed);
+
+    // Keep OS cursor centered (so the game capture assumptions stay stable).
+    HWND hwnd = g_gameHwnd.load(std::memory_order_relaxed);
+    CenterCursorOnGameClient(hwnd);
+
+    // Keep the game's "cursor" values at center in its own units.
+    LONG w = ReadI32(ADDR_VID_WIDTH);
+    LONG h = ReadI32(ADDR_VID_HEIGHT);
+    LONG halfW = (w >> 1);
+    LONG halfH = (h >> 1);
+
+    // Write raw input counts into the engine mouse vars.
+    WriteI32(ADDR_RAWMOUSE_X, dx);
+    WriteI32(ADDR_RAWMOUSE_Y, dy);
+
+    // Force engine cursor to center (prevents drift in code paths that read CursorX/Y).
+    WriteI32(ADDR_CURSOR_X, halfW);
+    WriteI32(ADDR_CURSOR_Y, halfH);
+
+    return true;
+}
+
+typedef void(__stdcall* FixMouseTrampFn)();
+static FixMouseTrampFn g_fixMouseTrampFn = nullptr;
+
+// Detour for 0x005E48C0.
+// We overwrite 6 bytes (the first instruction is "ADD EAX,[0060C326]" which is 6 bytes in x86).
+// If captured: inject WM_INPUT counts and jump to 0x005679BA (end of function).
+// If not captured: execute trampoline (original bytes) and continue normal behavior.
+__declspec(naked) void FixMouseLogic_Detour()
+{
+    __asm {
+        pushad
+        pushfd
+        call OnFixMouseLogic
+        test eax, eax
+        jz not_captured
+
+        popfd
+        popad
+        mov eax, ADDR_FIX_MOUSE_RET
+        jmp eax
+
+        not_captured :
+        popfd
+            popad
+            jmp g_fixMouseTrampFn
+    }
+}
+
+// Optional sanity check: verify the first bytes match "ADD EAX,[0060C326]" pattern.
+// x86 absolute add: 03 05 <addr32>
+static bool FixMouseBytesLookRight()
+{
+    uint8_t* p = (uint8_t*)ADDR_FIX_MOUSE_LOGIC;
+    __try
+    {
+        if (p[0] != 0x03) return false;
+        if (p[1] != 0x05) return false;
+        // Next 4 bytes should be 0x0060C326 (little endian: 26 C3 60 00)
+        if (*(uint32_t*)(p + 2) != 0x0060C326) return false;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool InstallFixMouseLogicHookOnce()
+{
+    if (g_fixMouseHooked.load(std::memory_order_relaxed))
+        return true;
+
+    if (!FixMouseBytesLookRight())
+    {
+        LogLine(L"[mouse] FIX MOUSE LOGIC bytes do not match expected pattern, not hooking");
+        return false;
+    }
+
+    uint8_t* target = (uint8_t*)ADDR_FIX_MOUSE_LOGIC;
+
+    memcpy(g_fixMouseOrig, target, sizeof(g_fixMouseOrig));
+
+    void* backTo = (void*)(ADDR_FIX_MOUSE_LOGIC + 6);
+    g_fixMouseTrampoline = MakeTrampoline((void*)target, g_fixMouseOrig, 6, backTo);
+    if (!g_fixMouseTrampoline)
+    {
+        LogLine(L"[mouse] Failed to allocate trampoline");
+        return false;
+    }
+
+    g_fixMouseTrampFn = (FixMouseTrampFn)g_fixMouseTrampoline;
+
+    // Patch 6 bytes: 5-byte JMP + 1 NOP
+    if (!WriteJmp5(target, (void*)&FixMouseLogic_Detour, 1))
+    {
+        LogLine(L"[mouse] Failed to patch FIX MOUSE LOGIC");
+        return false;
+    }
+
+    g_fixMouseHooked.store(true, std::memory_order_relaxed);
+    LogLine(L"[mouse] FIX MOUSE LOGIC hook installed at 0x005E48C0");
+    return true;
+}
+
+// ------------------------------------------------------------
 // Monitor thread
 // ------------------------------------------------------------
 
@@ -448,6 +660,8 @@ static DWORD WINAPI MonitorThread(LPVOID)
         HWND best = FindBestGameWindow();
         if (best)
         {
+            g_gameHwnd.store(best, std::memory_order_relaxed);
+
             TryInstallWndProcOnce(best);
 
             if (!g_rawRegistered.load(std::memory_order_relaxed))
@@ -458,6 +672,9 @@ static DWORD WINAPI MonitorThread(LPVOID)
 
             if (!clipHooked)
                 clipHooked = InstallClipCursorIAT();
+
+            // New: install the game mouse injection hook once the game is running.
+            InstallFixMouseLogicHookOnce();
         }
 
         Sleep(200);
@@ -482,6 +699,7 @@ static DWORD WINAPI InitThread(LPVOID)
     LogLine(L"[hook] WM_INPUT raw capture enabled");
     LogLine(L"[hook] ClipCursor hook enabled (capture detection)");
     LogLine(L"[hook] HUD shared memory: Local\\BHD_RawInput_Shared");
+    LogLine(L"[hook] RawMouse injector: hook at 0x005E48C0 (FIX MOUSE LOGIC)");
     LogLine(L"[hook] InitThread end");
 
     HANDLE h = CreateThread(nullptr, 0, MonitorThread, nullptr, 0, nullptr);
@@ -506,7 +724,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 
         g_stop.store(false, std::memory_order_relaxed);
 
-        // Create log immediately to prove attach ran.
         LogLine(L"[hook] DLL_PROCESS_ATTACH");
 
         HANDLE h = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
