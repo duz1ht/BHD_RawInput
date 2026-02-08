@@ -126,6 +126,11 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup>
+    <PostBuildEvent>
+      <Command>if not exist "$(OutDir)RawInput_Launcher.ini" copy /Y "$(ProjectDir)RawInput_Launcher.ini" "$(OutDir)RawInput_Launcher.ini"</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="launcher.cpp" />
   </ItemGroup>

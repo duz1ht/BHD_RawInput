@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <shellapi.h>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -34,11 +35,30 @@ static std::wstring Trim(const std::wstring& value)
     return value.substr(start, end - start + 1);
 }
 
+static std::wstring ToLower(const std::wstring& value)
+{
+    std::wstring out = value;
+    for (auto& ch : out)
+    {
+        ch = static_cast<wchar_t>(towlower(ch));
+    }
+    return out;
+}
+
 static bool IsPathAbsolute(const std::wstring& p)
 {
     if (p.size() >= 2 && p[1] == L':') return true;
     if (p.size() >= 2 && ((p[0] == L'\\' && p[1] == L'\\') || (p[0] == L'/' && p[1] == L'/'))) return true;
     return false;
+}
+
+static bool ParseBool(const std::wstring& value, bool defaultValue)
+{
+    std::wstring trimmed = ToLower(Trim(value));
+    if (trimmed.empty()) return defaultValue;
+    if (trimmed == L"1" || trimmed == L"true" || trimmed == L"yes" || trimmed == L"on") return true;
+    if (trimmed == L"0" || trimmed == L"false" || trimmed == L"no" || trimmed == L"off") return false;
+    return defaultValue;
 }
 
 static bool FileExists(const std::wstring& p)
@@ -58,20 +78,27 @@ static void MsgError(const std::wstring& msg)
     MessageBoxW(nullptr, msg.c_str(), L"BHD_RawInput_Launcher", MB_ICONERROR | MB_OK);
 }
 
-static std::wstring ReadGameExeFromIni(const std::wstring& exeDir, std::wofstream& log)
+struct LauncherConfig
 {
+    std::wstring gameExe;
+    bool allowCommandLineArgs = false;
+};
+
+static LauncherConfig ReadLauncherConfig(const std::wstring& exeDir, std::wofstream& log)
+{
+    LauncherConfig config;
     const std::wstring iniPath = JoinPath(exeDir, L"RawInput_Launcher.ini");
     if (!FileExists(iniPath))
     {
         LogLine(log, L"[launcher] RawInput_Launcher.ini not found. Using default.");
-        return L"";
+        return config;
     }
 
     std::wifstream ini(iniPath);
     if (!ini.is_open())
     {
         LogLine(log, L"[launcher] RawInput_Launcher.ini exists but could not be opened.");
-        return L"";
+        return config;
     }
 
     std::wstring line;
@@ -84,18 +111,67 @@ static std::wstring ReadGameExeFromIni(const std::wstring& exeDir, std::wofstrea
         size_t equals = trimmed.find(L'=');
         if (equals != std::wstring::npos)
         {
-            trimmed = Trim(trimmed.substr(equals + 1));
+            std::wstring key = ToLower(Trim(trimmed.substr(0, equals)));
+            std::wstring value = Trim(trimmed.substr(equals + 1));
+            if (key == L"gameexe" || key == L"exe" || key == L"exepath")
+            {
+                config.gameExe = value;
+                LogLine(log, L"[launcher] RawInput_Launcher.ini gameExe entry: " + value);
+                continue;
+            }
+            if (key == L"allowcommandline" || key == L"allowcommandlineargs" || key == L"allowargs")
+            {
+                config.allowCommandLineArgs = ParseBool(value, config.allowCommandLineArgs);
+                LogLine(log, L"[launcher] RawInput_Launcher.ini allowCommandLineArgs: " +
+                    std::wstring(config.allowCommandLineArgs ? L"true" : L"false"));
+                continue;
+            }
+            trimmed = value;
         }
 
         if (!trimmed.empty())
         {
-            LogLine(log, L"[launcher] RawInput_Launcher.ini gameExe entry: " + trimmed);
-            return trimmed;
+            if (config.gameExe.empty())
+            {
+                config.gameExe = trimmed;
+                LogLine(log, L"[launcher] RawInput_Launcher.ini gameExe entry: " + trimmed);
+            }
         }
     }
 
-    LogLine(log, L"[launcher] RawInput_Launcher.ini is present but contains no valid game exe entry.");
-    return L"";
+    if (config.gameExe.empty())
+    {
+        LogLine(log, L"[launcher] RawInput_Launcher.ini is present but contains no valid game exe entry.");
+    }
+    return config;
+}
+
+static bool SplitCommandLine(const std::wstring& raw, std::wstring& exeOut, std::wstring& argsOut)
+{
+    exeOut.clear();
+    argsOut.clear();
+    if (raw.empty()) return false;
+
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(raw.c_str(), &argc);
+    if (!argv || argc == 0)
+    {
+        if (argv) LocalFree(argv);
+        return false;
+    }
+
+    exeOut = argv[0];
+    if (argc > 1)
+    {
+        for (int i = 1; i < argc; ++i)
+        {
+            if (!argsOut.empty()) argsOut += L" ";
+            argsOut += argv[i];
+        }
+    }
+
+    LocalFree(argv);
+    return true;
 }
 
 static bool InjectDll(DWORD pid, const std::wstring& dllPath, std::wofstream& log)
@@ -185,14 +261,19 @@ int wmain(int argc, wchar_t** argv)
     LogLine(log, L"[launcher] ExeDir: " + exeDir);
 
     std::wstring gameExe;
+    std::wstring gameArgs;
+    bool allowArgs = false;
     if (argc >= 2)
     {
         gameExe = argv[1];
+        allowArgs = true;
         LogLine(log, L"[launcher] gameExe overridden by command-line argument.");
     }
     else
     {
-        gameExe = ReadGameExeFromIni(exeDir, log);
+        LauncherConfig config = ReadLauncherConfig(exeDir, log);
+        allowArgs = config.allowCommandLineArgs;
+        gameExe = config.gameExe;
         if (gameExe.empty())
         {
             gameExe = L"dfbhd.exe";
@@ -200,17 +281,35 @@ int wmain(int argc, wchar_t** argv)
         }
     }
 
-    if (!IsPathAbsolute(gameExe))
+    std::wstring resolvedExe;
+    std::wstring resolvedArgs;
+    if (!SplitCommandLine(gameExe, resolvedExe, resolvedArgs))
     {
-        gameExe = JoinPath(exeDir, gameExe);
+        resolvedExe = gameExe;
+    }
+
+    if (!allowArgs && !resolvedArgs.empty())
+    {
+        LogLine(log, L"[launcher] Command-line args ignored because allowCommandLineArgs=false.");
+        resolvedArgs.clear();
+    }
+
+    if (!IsPathAbsolute(resolvedExe))
+    {
+        resolvedExe = JoinPath(exeDir, resolvedExe);
     }
 
     const std::wstring dllPath = JoinPath(exeDir, L"BHD_RawInput_Hook.dll");
 
-    LogLine(log, L"[launcher] gameExe: " + gameExe);
+    LogLine(log, L"[launcher] gameExe: " + resolvedExe);
+    LogLine(log, L"[launcher] allowCommandLineArgs: " + std::wstring(allowArgs ? L"true" : L"false"));
+    if (!resolvedArgs.empty())
+    {
+        LogLine(log, L"[launcher] gameArgs: " + resolvedArgs);
+    }
     LogLine(log, L"[launcher] dllPath: " + dllPath);
 
-    if (!FileExists(gameExe))
+    if (!FileExists(resolvedExe))
     {
         LogLine(log, L"[launcher] ERROR: game executable not found.");
         MsgError(L"The game executable was not found. Check launcher_log.txt for details.");
@@ -226,8 +325,8 @@ int wmain(int argc, wchar_t** argv)
 
     std::wstring workDir;
     {
-        size_t slash = gameExe.find_last_of(L"\\/");
-        workDir = (slash == std::wstring::npos) ? exeDir : gameExe.substr(0, slash);
+        size_t slash = resolvedExe.find_last_of(L"\\/");
+        workDir = (slash == std::wstring::npos) ? exeDir : resolvedExe.substr(0, slash);
     }
     LogLine(log, L"[launcher] workDir: " + workDir);
 
@@ -235,7 +334,11 @@ int wmain(int argc, wchar_t** argv)
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
 
-    std::wstring cmdLine = L"\"" + gameExe + L"\"";
+    std::wstring cmdLine = L"\"" + resolvedExe + L"\"";
+    if (!resolvedArgs.empty())
+    {
+        cmdLine += L" " + resolvedArgs;
+    }
     std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
     cmdBuf.push_back(L'\0');
 
