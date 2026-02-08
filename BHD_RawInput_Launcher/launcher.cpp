@@ -25,6 +25,22 @@ static std::wstring JoinPath(const std::wstring& a, const std::wstring& b)
     return a + L"\\" + b;
 }
 
+static std::wstring Trim(const std::wstring& value)
+{
+    const std::wstring whitespace = L" \t\r\n";
+    const size_t start = value.find_first_not_of(whitespace);
+    if (start == std::wstring::npos) return L"";
+    const size_t end = value.find_last_not_of(whitespace);
+    return value.substr(start, end - start + 1);
+}
+
+static bool IsPathAbsolute(const std::wstring& p)
+{
+    if (p.size() >= 2 && p[1] == L':') return true;
+    if (p.size() >= 2 && ((p[0] == L'\\' && p[1] == L'\\') || (p[0] == L'/' && p[1] == L'/'))) return true;
+    return false;
+}
+
 static bool FileExists(const std::wstring& p)
 {
     DWORD a = GetFileAttributesW(p.c_str());
@@ -40,6 +56,46 @@ static void LogLine(std::wofstream& log, const std::wstring& s)
 static void MsgError(const std::wstring& msg)
 {
     MessageBoxW(nullptr, msg.c_str(), L"BHD_RawInput_Launcher", MB_ICONERROR | MB_OK);
+}
+
+static std::wstring ReadGameExeFromIni(const std::wstring& exeDir, std::wofstream& log)
+{
+    const std::wstring iniPath = JoinPath(exeDir, L"RawInput_Launcher.ini");
+    if (!FileExists(iniPath))
+    {
+        LogLine(log, L"[launcher] RawInput_Launcher.ini not found. Using default.");
+        return L"";
+    }
+
+    std::wifstream ini(iniPath);
+    if (!ini.is_open())
+    {
+        LogLine(log, L"[launcher] RawInput_Launcher.ini exists but could not be opened.");
+        return L"";
+    }
+
+    std::wstring line;
+    while (std::getline(ini, line))
+    {
+        std::wstring trimmed = Trim(line);
+        if (trimmed.empty()) continue;
+        if (trimmed[0] == L';' || trimmed[0] == L'#') continue;
+
+        size_t equals = trimmed.find(L'=');
+        if (equals != std::wstring::npos)
+        {
+            trimmed = Trim(trimmed.substr(equals + 1));
+        }
+
+        if (!trimmed.empty())
+        {
+            LogLine(log, L"[launcher] RawInput_Launcher.ini gameExe entry: " + trimmed);
+            return trimmed;
+        }
+    }
+
+    LogLine(log, L"[launcher] RawInput_Launcher.ini is present but contains no valid game exe entry.");
+    return L"";
 }
 
 static bool InjectDll(DWORD pid, const std::wstring& dllPath, std::wofstream& log)
@@ -128,8 +184,26 @@ int wmain(int argc, wchar_t** argv)
     LogLine(log, L"[launcher] Started.");
     LogLine(log, L"[launcher] ExeDir: " + exeDir);
 
-    std::wstring gameExe = JoinPath(exeDir, L"dfbhd.exe");
-    if (argc >= 2) gameExe = argv[1];
+    std::wstring gameExe;
+    if (argc >= 2)
+    {
+        gameExe = argv[1];
+        LogLine(log, L"[launcher] gameExe overridden by command-line argument.");
+    }
+    else
+    {
+        gameExe = ReadGameExeFromIni(exeDir, log);
+        if (gameExe.empty())
+        {
+            gameExe = L"dfbhd.exe";
+            LogLine(log, L"[launcher] Using default gameExe: dfbhd.exe");
+        }
+    }
+
+    if (!IsPathAbsolute(gameExe))
+    {
+        gameExe = JoinPath(exeDir, gameExe);
+    }
 
     const std::wstring dllPath = JoinPath(exeDir, L"BHD_RawInput_Hook.dll");
 
@@ -138,8 +212,8 @@ int wmain(int argc, wchar_t** argv)
 
     if (!FileExists(gameExe))
     {
-        LogLine(log, L"[launcher] ERROR: dfbhd.exe not found.");
-        MsgError(L"dfbhd.exe was not found. Check launcher_log.txt for details.");
+        LogLine(log, L"[launcher] ERROR: game executable not found.");
+        MsgError(L"The game executable was not found. Check launcher_log.txt for details.");
         return 1;
     }
 
