@@ -1,4 +1,4 @@
-// dllmain.cpp : BHD_RawInput_Hook
+// dllmain.cpp : RawInput_Fix
 //
 // Features:
 //  - Hooks the game window WndProc to capture WM_INPUT raw mouse deltas.

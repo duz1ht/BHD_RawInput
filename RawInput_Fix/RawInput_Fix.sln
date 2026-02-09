@@ -3,11 +3,11 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.13.35931.197
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "BHD_RawInput_Hook", "BHD_RawInput_Hook.vcxproj", "{D6008D3B-F982-41E1-894C-7D796D17A2C8}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RawInput_Fix", "RawInput_Fix.vcxproj", "{D6008D3B-F982-41E1-894C-7D796D17A2C8}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "BHD_RawInput_Launcher", "..\BHD_RawInput_Launcher\BHD_RawInput_Launcher.vcxproj", "{3704BB20-6CDB-4EB8-9053-8D94F98E831E}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RawInput_Launcher", "..\RawInput_Launcher\RawInput_Launcher.vcxproj", "{3704BB20-6CDB-4EB8-9053-8D94F98E831E}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "BHD_RawInput_Monitor", "..\BHD_RawInput_Monitor\BHD_RawInput_Monitor.vcxproj", "{254F1853-D8F9-4816-9521-41EA32D0DB57}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RawInput_Monitor", "..\RawInput_Monitor\RawInput_Monitor.vcxproj", "{254F1853-D8F9-4816-9521-41EA32D0DB57}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

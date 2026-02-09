@@ -24,17 +24,17 @@
     <ClInclude Include="Resource.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="BHD Translarent RawInput HUD.h">
+    <ClInclude Include="RawInput_Monitor.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="BHD_RawInput_Monitor.cpp">
+    <ClCompile Include="RawInput_Monitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="BHD Translarent RawInput HUD.rc">
+    <ResourceCompile Include="RawInput_Monitor.rc">
       <Filter>Resource Files</Filter>
     </ResourceCompile>
   </ItemGroup>
@@ -42,7 +42,7 @@
     <Image Include="small.ico">
       <Filter>Resource Files</Filter>
     </Image>
-    <Image Include="BHD Translarent RawInput HUD.ico">
+    <Image Include="RawInput_Monitor.ico">
       <Filter>Resource Files</Filter>
     </Image>
   </ItemGroup>

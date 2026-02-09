@@ -1,4 +1,4 @@
-// BHD_RawInput_Monitor.cpp
+// RawInput_Monitor.cpp
 //
 // Transparent click-through overlay aligned to dfbhd.exe client area.
 // Reads shared memory: Local\\BHD_RawInput_Shared (version 2).
@@ -411,7 +411,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 {
-    const wchar_t* kClass = L"BHD_RawInput_Monitor_Class";
+    const wchar_t* kClass = L"RawInput_Monitor_Class";
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -428,7 +428,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 
     g_hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        kClass, L"BHD RawInput Monitor",
+        kClass, L"RawInput Monitor",
         WS_POPUP,
         100, 100, 640, 360,
         nullptr, nullptr, hInst, nullptr);
