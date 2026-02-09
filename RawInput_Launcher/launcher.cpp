@@ -75,7 +75,7 @@ static void LogLine(std::wofstream& log, const std::wstring& s)
 
 static void MsgError(const std::wstring& msg)
 {
-    MessageBoxW(nullptr, msg.c_str(), L"BHD_RawInput_Launcher", MB_ICONERROR | MB_OK);
+    MessageBoxW(nullptr, msg.c_str(), L"RawInput_Launcher", MB_ICONERROR | MB_OK);
 }
 
 struct LauncherConfig
@@ -299,7 +299,7 @@ int wmain(int argc, wchar_t** argv)
         resolvedExe = JoinPath(exeDir, resolvedExe);
     }
 
-    const std::wstring dllPath = JoinPath(exeDir, L"BHD_RawInput_Hook.dll");
+    const std::wstring dllPath = JoinPath(exeDir, L"RawInput_Fix.dll");
 
     LogLine(log, L"[launcher] gameExe: " + resolvedExe);
     LogLine(log, L"[launcher] allowCommandLineArgs: " + std::wstring(allowArgs ? L"true" : L"false"));
@@ -318,8 +318,8 @@ int wmain(int argc, wchar_t** argv)
 
     if (!FileExists(dllPath))
     {
-        LogLine(log, L"[launcher] ERROR: BHD_RawInput_Hook.dll not found.");
-        MsgError(L"BHD_RawInput_Hook.dll was not found. Check launcher_log.txt for details.");
+        LogLine(log, L"[launcher] ERROR: RawInput_Fix.dll not found.");
+        MsgError(L"RawInput_Fix.dll was not found. Check launcher_log.txt for details.");
         return 2;
     }
 
